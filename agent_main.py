@@ -55,6 +55,21 @@ RUNTIME_DIR = WORKDIR / ".runtime-tasks"
 RUNTIME_DIR.mkdir(exist_ok=True)
 STALL_THRESHOLD_S = 45  # seconds before a task is considered stalled
 
+# Persisted-output: large tool outputs written to disk, replaced with preview marker
+CONTEXT_LIMIT = 50000
+KEEP_RECENT_TOOL_RESULTS = 3
+PERSIST_THRESHOLD = 30000
+PREVIEW_CHARS = 2000
+TRANSCRIPT_DIR = WORKDIR / ".transcripts"
+TASK_OUTPUT_DIR = WORKDIR / ".task_outputs"
+TOOL_RESULTS_DIR = TASK_OUTPUT_DIR / "tool-results"
+PERSIST_OUTPUT_TRIGGER_CHARS_DEFAULT = 50000
+PERSIST_OUTPUT_TRIGGER_CHARS_BASH = 30000
+CONTEXT_TRUNCATE_CHARS = 50000
+PERSISTED_OPEN = "<persisted-output>"
+PERSISTED_CLOSE = "</persisted-output>"
+PERSISTED_PREVIEW_CHARS = 2000
+
 # Recovery constants
 MAX_RECOVERY_ATTEMPTS = 3
 BACKOFF_BASE_DELAY = 1.0  # seconds
@@ -95,6 +110,146 @@ VALID_MSG_TYPES = {
 PERMISSION_MODES = ("default", "auto")
 
 _claim_lock = threading.Lock()
+
+
+# === persisted_output ===
+@dataclass
+class CompactState:
+    has_compacted: bool = False
+    last_summary: str = ""
+    recent_files: list[str] = field(default_factory=list)
+
+
+def estimate_context_size(messages: list) -> int:
+    return len(str(messages))
+
+
+def _persist_tool_result(tool_use_id: str, content: str) -> Path:
+    TOOL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    safe_id = re.sub(r"[^a-zA-Z0-9_.-]", "_", tool_use_id or "unknown")
+    path = TOOL_RESULTS_DIR / f"{safe_id}.txt"
+    if not path.exists():
+        path.write_text(content)
+    return path.relative_to(WORKDIR)
+
+
+def _format_size(size: int) -> str:
+    if size < 1024:
+        return f"{size}B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f}KB"
+    return f"{size / (1024 * 1024):.1f}MB"
+
+
+def _preview_slice(text: str, limit: int) -> tuple[str, bool]:
+    if len(text) <= limit:
+        return text, False
+    idx = text[:limit].rfind("\n")
+    cut = idx if idx > (limit * 0.) else limit
+    return text[:cut], True
+
+
+def _build_persisted_marker(stored_path: Path, content: str) -> str:
+    preview, has_more = _preview_slice(content, PERSISTED_PREVIEW_CHARS)
+    marker = (
+        f"{PERSISTED_OPEN}\n"
+        f"Output too large ({_format_size(len(content))}). "
+        f"Full output saved to: {stored_path}\n\n"
+        f"Preview (first {_format_size(PERSISTED_PREVIEW_CHARS)}):\n"
+        f"{preview}"
+    )
+    if has_more:
+        marker += "\n..."
+    marker += f"\n{PERSISTED_CLOSE}"
+    return marker
+
+
+def maybe_persist_output(tool_use_id: str, output: str, trigger_chars: int = None) -> str:
+    if not isinstance(output, str):
+        return str(output)
+    trigger = PERSIST_OUTPUT_TRIGGER_CHARS_DEFAULT if trigger_chars is None else int(trigger_chars)
+    if len(output) <= trigger:
+        return output
+    stored_path = _persist_tool_result(tool_use_id, output)
+    return _build_persisted_marker(stored_path, output)
+
+
+def collect_tool_result_blocks(messages: list) -> list[tuple[int, int, dict]]:
+    blocks = []
+    for message_index, message in enumerate(messages):
+        content = message.get("content")
+        if message.get("role") != "user" or not isinstance(content, list):
+            continue
+        for block_index, block in enumerate(content):
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                blocks.append((message_index, block_index, block))
+    return blocks
+
+
+def micro_compact(messages: list) -> list:
+    tool_results = collect_tool_result_blocks(messages)
+    if len(tool_results) <= KEEP_RECENT_TOOL_RESULTS:
+        return messages
+
+    for _, _, block in tool_results[:-KEEP_RECENT_TOOL_RESULTS]:
+        content = block.get("content", "")
+        if not isinstance(content, str) or len(content) <= 120:
+            continue
+        block["content"] = "[Earlier tool result compacted. Re-run the tool if you need full detail.]"
+    return messages
+
+
+def write_transcript(messages: list) -> Path:
+    TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+    path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
+    with path.open("w") as handle:
+        for message in messages:
+            handle.write(json.dumps(message, default=str) + "\n")
+    return path
+
+
+def summarize_history(messages: list) -> str:
+    conversation = json.dumps(messages, default=str)[:80000]
+    prompt = (
+        "Summarize this coding-agent conversation so work can continue.\n"
+        "Preserve:\n"
+        "1. The current goal\n"
+        "2. Important findings and decisions\n"
+        "3. Files read or changed\n"
+        "4. Remaining work\n"
+        "5. User constraints and preferences\n"
+        "Be compact but concrete.\n\n"
+        f"{conversation}"
+    )
+    response = client.messages.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=2000,
+    )
+    return response.content[0].text.strip()
+
+
+def compact_history(messages: list, state: CompactState, focus: str | None = None) -> list:
+    transcript_path = write_transcript(messages)
+    print(f"[transcript saved: {transcript_path}]")
+
+    summary = summarize_history(messages)
+    if focus:
+        summary += f"\n\nFocus to preserve next: {focus}"
+    if state.recent_files:
+        recent_lines = "\n".join(f"- {path}" for path in state.recent_files)
+        summary += f"\n\nRecent files to reopen if needed:\n{recent_lines}"
+
+    state.has_compacted = True
+    state.last_summary = summary
+
+    return [{
+        "role": "user",
+        "content": (
+            "This conversation was compacted so the agent can continue working.\n\n"
+            f"{summary}"
+        ),
+    }]
 
 
 def detect_repo_root(cwd: Path) -> Path | None:
@@ -1098,7 +1253,7 @@ class WorktreeManager:
         self.repo_root = repo_root
         self.tasks = tasks
         self.events = events
-        self.dir = repo_root / "worktrees"
+        self.dir = repo_root / ".worktrees"
         self.dir.mkdir(parents=True, exist_ok=True)
         self.index_path = self.dir / "index.json"
         if not self.index_path.exists():
@@ -2404,6 +2559,7 @@ class MCPToolRouter:
     native tools in the same tool pool. The router strips the prefix
     and dispatches to the right MCPClient.
     """
+
     def __init__(self):
         self.clients = {}
 
@@ -2514,7 +2670,6 @@ class CapabilityPermissionGate:
 # permission_gate = CapabilityPermissionGate()
 
 
-
 # -- Tool implementations --
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
@@ -2523,7 +2678,7 @@ def safe_path(p: str) -> Path:
     return path
 
 
-def run_bash(command: str) -> str:
+def run_bash(command: str, tool_use_id: str = "") -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
@@ -2531,17 +2686,24 @@ def run_bash(command: str) -> str:
         r = subprocess.run(command, shell=True, cwd=WORKDIR,
                            capture_output=True, text=True, timeout=120)
         out = (r.stdout + r.stderr).strip()
-        return out[:50000] if out else "(no output)"
+        if not out:
+            return "(no output)"
+        out = maybe_persist_output(tool_use_id, out, trigger_chars=PERSIST_OUTPUT_TRIGGER_CHARS_BASH)
+        # return out[:CONTEXT_TRUNCATE_CHARS] if isinstance(out, str) else str(out)[:CONTEXT_TRUNCATE_CHARS]
+        return out
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
 
 
-def run_read(path: str, limit: int = None) -> str:
+def run_read(path: str, limit: int = None, tool_use_id: str = "") -> str:
     try:
         lines = safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(lines) - limit} more)"]
-        return "\n".join(lines)[:50000]
+        out = "\n".join(lines)
+        out = maybe_persist_output(tool_use_id, out)
+        # return out[:CONTEXT_TRUNCATE_CHARS] if isinstance(out, str) else str(out)[:CONTEXT_TRUNCATE_CHARS]
+        return out
     except Exception as e:
         return f"Error: {e}"
 
@@ -2614,7 +2776,7 @@ def run_save_memory(name: str, description: str, mem_type: str, content: str) ->
 
 
 NATIVE_HANDLERS = {
-    "bash": lambda **kw: run_bash(kw["command"]),
+    "bash": lambda **kw: run_bash(kw["command"], kw.get("tool_use_id", "")),
     "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
@@ -2625,6 +2787,7 @@ NATIVE_HANDLERS = {
     "task_update": lambda **kw: TASKS.update(kw["task_id"], kw.get("status"), kw.get("owner"), kw.get("addBlockedBy"),
                                              kw.get("addBlocks")),
     "task_list": lambda **kw: TASKS.list_all(),
+    "compress": lambda **kw: "Compressing...",
     "task_get": lambda **kw: TASKS.get(kw["task_id"]),
     "background_run": lambda **kw: BG.run(kw["command"]),
     "check_background": lambda **kw: BG.check(kw.get("task_id")),
@@ -2742,6 +2905,8 @@ NATIVE_TOOLS = [
             "required": ["name"],
         },
     },
+    {"name": "compress", "description": "Manually compress conversation context.",
+     "input_schema": {"type": "object", "properties": {}}},
     {"name": "background_run", "description": "Run command in background thread. Returns task_id immediately.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
     {"name": "check_background", "description": "Check background task status. Omit task_id to list all.",
@@ -2836,8 +3001,6 @@ When NOT to save:
 - Secrets or credentials (API keys, passwords)
 """
 
-
-
 # -- MCP Tool Router (global) --
 mcp_router = MCPToolRouter()
 plugin_loader = PluginLoader()
@@ -2902,10 +3065,9 @@ def permission_execute_tool(block, results, permission_gate: CapabilityPermissio
     })
 
 
-def pre_hooks(results: list, ctx: dict, hooks: HookManager, ):
+def pre_hooks(results: list, ctx: dict, hooks: HookManager):
     # -- PreToolUse hooks --
     pre_result = hooks.run_hooks("PreToolUse", ctx)
-    block.input = ctx.get("tool_input")
 
     # Inject hook messages into results
     for msg in pre_result.get("messages", []):
@@ -2934,7 +3096,6 @@ def post_hooks(ctx: dict, output: str, hooks: HookManager, ):
 def hook_and_tool(block, results, hooks: HookManager, decision: dict):
     tool_input = dict(block.input or {})
     ctx = {"tool_name": block.name, "tool_input": tool_input}
-
     pre_hooks_res = pre_hooks(results, ctx, hooks)
     if pre_hooks_res:
         return
@@ -2954,7 +3115,7 @@ def hook_and_tool(block, results, hooks: HookManager, decision: dict):
 prompt_builder = SystemPromptBuilder(workdir=WORKDIR, tools=build_tool_pool())
 
 
-def agent_loop(messages: list, hooks: HookManager, perms: CapabilityPermissionGate):
+def agent_loop(messages: list, hooks: HookManager, perms: CapabilityPermissionGate, state: CompactState):
     """
     Agent loop with assembled system prompt.
 
@@ -2989,6 +3150,12 @@ def agent_loop(messages: list, hooks: HookManager, perms: CapabilityPermissionGa
                 "role": "assistant",
                 "content": "Noted inbox messages",
             })
+
+        messages[:] = micro_compact(messages)
+
+        if estimate_context_size(messages) > CONTEXT_LIMIT:
+            print("[auto compact]")
+            messages[:] = compact_history(messages, state)
 
         response = None
         for attempt in range(MAX_RECOVERY_ATTEMPTS + 1):
@@ -3052,6 +3219,8 @@ def agent_loop(messages: list, hooks: HookManager, perms: CapabilityPermissionGa
 
         results = []
         used_todo = False
+        manual_compact = False
+        compact_focus = None
         for block in response.content:
             if block.type != "tool_use":
                 continue
@@ -3060,6 +3229,9 @@ def agent_loop(messages: list, hooks: HookManager, perms: CapabilityPermissionGa
 
             if block.name == "todo":
                 used_todo = True
+            if block.name == "compact":
+                manual_compact = True
+                compact_focus = (block.input or {}).get("focus")
         if used_todo:
             TODO.state.rounds_since_update = 0
         else:
@@ -3070,6 +3242,10 @@ def agent_loop(messages: list, hooks: HookManager, perms: CapabilityPermissionGa
                 results.append({"type": "text", "text": reminder})
 
         messages.append({"role": "user", "content": results})
+
+        if manual_compact:
+            print("[manual compact]")
+            messages[:] = compact_history(messages, state, focus=compact_focus)
 
         # Check if we should auto-compact (proactive, not just reactive)
         if estimate_tokens(messages) > TOKEN_THRESHOLD:
@@ -3112,7 +3288,7 @@ if __name__ == "__main__":
     mcp_count = len(mcp_router.get_all_tools())
     print(f"[Tool pool: {tool_count} tools ({mcp_count} from MCP)]")
 
-
+    compact_state = CompactState()
     history = []
     while True:
 
@@ -3174,7 +3350,6 @@ if __name__ == "__main__":
                 print("  (no MCP servers connected)")
             continue
 
-
         # # /rules command to show current rules
         # if query.strip() == "/rules":
         #     for i, rule in enumerate(perms.rules):
@@ -3194,7 +3369,7 @@ if __name__ == "__main__":
             continue
 
         history.append({"role": "user", "content": query})
-        agent_loop(history, hooks, perms)
+        agent_loop(history, hooks, perms, compact_state)
         response_content = history[-1]["content"]
         if isinstance(response_content, list):
             for block in response_content:
