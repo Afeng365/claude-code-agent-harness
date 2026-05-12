@@ -3,7 +3,11 @@
 
 import json
 import time
+import uuid
+
 from anthropic import APIError
+from langsmith import traceable
+from langsmith.run_helpers import get_current_run_tree
 
 from dao.anthropic_utils import client
 from handlers.background_tasks import BG
@@ -21,11 +25,10 @@ from handlers.system_prompt import SystemPromptBuilder
 from handlers.team_system import TEAM, BUS
 from handlers.todomanager import TODO
 
-
 prompt_builder = SystemPromptBuilder(workdir=WORKDIR, tools=build_tool_pool())
 
 
-
+@traceable(run_type="llm")
 def agent_loop(messages: list, hooks: HookManager, perms: CapabilityPermissionGate, state: CompactState):
     """
     Agent loop with assembled system prompt.
@@ -35,6 +38,7 @@ def agent_loop(messages: list, hooks: HookManager, perms: CapabilityPermissionGa
     """
     max_output_recovery_count = 0
     tools = build_tool_pool()
+
     while True:
         system = prompt_builder.build()
         notifs = BG.drain_notifications()
@@ -278,8 +282,21 @@ if __name__ == "__main__":
                     print(f"  {line}")
             continue
 
+        run_id = str(uuid.uuid4())
+        langsmith_project = "anthropic-coding"
+
+        session_id = "thread-id-1"
+        langsmith_extra = {"run_id": run_id, "project_name": langsmith_project,
+                           "tags": ["learn"],
+                           "metadata": {
+                               "user_id": "Afeng",
+                               "session_id": session_id,
+                               "ls_provider": "deepseek",
+                               "ls_model_name": "deepseek-chat"
+                           },
+                           }
         history.append({"role": "user", "content": query})
-        agent_loop(history, hooks, perms, compact_state)
+        agent_loop(history, hooks, perms, compact_state, langsmith_extra=langsmith_extra)
         response_content = history[-1]["content"]
         if isinstance(response_content, list):
             for block in response_content:

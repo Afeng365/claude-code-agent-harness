@@ -1,5 +1,7 @@
 import os
 
 from anthropic import Anthropic
+from langsmith.wrappers import wrap_anthropic
 
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+client = wrap_anthropic(Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL")))
+
