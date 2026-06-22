@@ -5,6 +5,8 @@ import time
 import uuid
 from pathlib import Path
 
+from langsmith import traceable, get_current_run_tree
+
 from dao.anthropic_utils import client
 from handlers.compact_context import maybe_persist_output
 from log import logging
@@ -270,15 +272,25 @@ class TeammateManager:
             member = {"name": name, "role": role, "status": "working"}
             self.config["members"].append(member)
         self._save_config()
+        run_id = str(uuid.uuid4())
+        langsmith_project = "anthropic-coding"
+        session_id = uuid.uuid4()
+        rt = get_current_run_tree()
+        langsmith_extra = {"run_id": run_id, "project_name": langsmith_project,
+                           "parent": rt,
+                           "metadata": {"user_id": name, "session_id": session_id}}
+
         thread = threading.Thread(
             target=self._teammate_loop,
             args=(name, role, prompt),
+            kwargs={"langsmith_extra": langsmith_extra},
             daemon=True,
         )
         self.threads[name] = thread
         thread.start()
         return f"Spawned {name} (role: {role})"
 
+    @traceable()
     def _teammate_loop(self, name: str, role: str, prompt: str):
         team_name = self.config["team_name"]
         sys_prompt = (
